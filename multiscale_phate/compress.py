@@ -1,22 +1,13 @@
-import contextlib
+import warnings
+
 import numpy as np
 import joblib
 import tasklogger
 import sklearn.cluster
 import sklearn.neighbors
 import scipy.spatial.distance
+
 from joblib.externals.loky import set_loky_pickler
-
-
-@contextlib.contextmanager
-def custom_loky_pickler(pickler):
-    try:
-        set_loky_pickler(pickler)
-        yield
-    finally:
-        # revert to default
-        set_loky_pickler()
-
 
 def get_compression_features(N, features, n_pca, partitions, landmarks):
     """Short summary.
@@ -144,27 +135,53 @@ def subset_data(data, desired_num_clusters, n_jobs, num_cluster=100, random_stat
         clusters_unique, cluster_counts = np.unique(clusters, return_counts=True)
         clusters_next_iter = clusters.copy()
 
-        with custom_loky_pickler('pickle'):
-            while np.max(cluster_counts) > np.ceil(N / desired_num_clusters):
-                min_val = 0
-                partitions_id_uni = joblib.Parallel(n_jobs=n_jobs)(
-                    joblib.delayed(cluster_components)(
-                        data[np.where(clusters == clusters_unique[i])[0], :],
-                        num_cluster,
-                        size,
-                        random_state=random_state,
-                    )
-                    for i in range(len(clusters_unique))
+        prev_max = -1
+        counter = 0
+        patience = 10
+        current_iter = 0
+
+        set_loky_pickler('pickle')
+
+        while np.max(cluster_counts) > np.ceil(N / desired_num_clusters):
+            current_iter += 1
+            min_val = 0
+            partitions_id_uni = joblib.Parallel(n_jobs=n_jobs)(
+                joblib.delayed(cluster_components)(
+                    data[np.where(clusters == clusters_unique[i])[0], :],
+                    num_cluster,
+                    size,
+                    random_state=random_state,
                 )
+                for i in range(len(clusters_unique))
+            )
 
-                for i in range(len(clusters_unique)):
-                    loc = np.where(clusters == clusters_unique[i])[0]
-                    clusters_next_iter[loc] = np.array(partitions_id_uni[i]) + min_val
-                    min_val = min_val + np.max(np.array(partitions_id_uni[i])) + 1
+            for i in range(len(clusters_unique)):
+                loc = np.where(clusters == clusters_unique[i])[0]
+                clusters_next_iter[loc] = np.array(partitions_id_uni[i]) + min_val
+                min_val = min_val + np.max(np.array(partitions_id_uni[i])) + 1
 
-                clusters = clusters_next_iter.copy()
-                clusters_unique, cluster_counts = np.unique(clusters, return_counts=True)
+            clusters = clusters_next_iter.copy()
+            clusters_unique, cluster_counts = np.unique(clusters, return_counts=True)
 
+            current_max = np.max(cluster_counts)
+
+            # Do we have enough clusters?
+            if clusters_unique.shape[0] >= desired_num_clusters:
+                tasklogger.log_info(f'Breaking the partitions loop because we have more than {desired_num_clusters} clusters...')
+                break
+
+            # Break if we exceed patience
+            if current_max == prev_max:
+                counter += 1
+                if counter >= patience:
+                    tasklogger.log_warning(f'Breaking the partitions loop after {current_iter} total iterations and {patience} iterations without shrinking the max cluster. Consider removing duplicates.')
+                    break
+            else:
+                prev_max = current_max
+                counter = 0
+
+        # Returning
+        tasklogger.log_info(f'Returning an initial partition of {np.unique(clusters).shape[0]} clusters...')
     return clusters
 
 
